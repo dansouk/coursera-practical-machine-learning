@@ -1,0 +1,191 @@
+---
+title: "Practical Machine Learning Course Project"
+output: html_document
+author: Dan Souk
+date: October, 2019
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library(caret)
+library(C50)
+library(corrplot)
+library(rpart)
+library(rpart.plot)
+library(rattle)
+library(DAAG)
+setwd('d:/GitRepos/mooc/coursera-datascience-johnshopkins/08-PracticalMachineLearning/course-project/')
+data_train = read.csv('pml-training.csv', strip.white = TRUE, na.strings=c("NA","","#DIV/0!"))
+data_quiz = read.csv('pml-testing.csv', strip.white = TRUE, na.strings=c("NA","","#DIV/0!"))
+set.seed(123)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Goal
+In this project, the goal is to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. Those are:
+* Exactly according to the specification (Class A)
+* Throwing the elbows to the front (Class B) - mistake
+* Lifting the dumbbell only halfway (Class C) - mistake
+* Lowering the dumbbell only halfway (Class D) - mistake
+* Throwing the hips to the front (Class E) - mistake
+
+## Source Data and Exploration
+Data for this project is from this paper:
+Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. Qualitative Activity Recognition of Weight Lifting Exercises. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013. http://groupware.les.inf.puc-rio.br/har (see the section on the Weight Lifting Exercise Dataset). Thank you to the authors for making this available.
+
+For reference, training data is found at https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv, while test data is available at https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv.
+
+A quick look at the two datasets shows there are `r dim(data_train)[1]` rows and `r dim(data_train)[2]` variables for the training data. The test data also contains `r dim(data_quiz)[2]` variables but only `r dim(data_quiz)[1]` rows. Since the test data will be used to answer the final course quiz, we'll need to split the training data up to create subsets for training and validation.
+
+First, though let's see how clean this data is. The structure of the data is pretty simple, so we don't have to worry about matching multiple files, etc. But, we do need to see how much useful data is in each set.
+
+## Clean the data
+Let's remove columns that have 90% or more NAs. That's an arbitrary cut-off, but seems reasonable.
+```{r}
+na_cols = which(colMeans(is.na(data_train)) > 0.9)
+train_clean = data_train[, -na_cols]
+quiz_clean = data_quiz[, -na_cols]
+```
+We've been able to remove `r dim(data_train)[2] - dim(data_train)[2]`, leaving us with `r dim(train_clean)[2]` variables.
+
+### Find zero / near-zero variance variables
+Let's check for any variables that have near-zero variance; ie, constants and similar types of data. These have little, if any, predictive value, so we'll remove them as well.
+```{r}
+nzv = nearZeroVar(train_clean)
+train_clean = train_clean[, -nzv]
+quiz_clean = quiz_clean[, -nzv]
+```
+That takes us down to `r dim(train_clean)[2]` variables.
+
+### Remove unnecessary variables
+Finally, there are also a handful of variables that do not appear to be needed - the first six columns - X, user_name, raw_timestamp_part1, raw_timestamp_part2, cvtd_timestamp and num_window.
+
+```{r}
+train_clean = train_clean[, -c(1:6)]
+quiz_clean = quiz_clean[, -c(1:6)]
+```
+
+### Find redundant variables
+We can probably reduce that number even further by finding variables that are highly correlated with each other. For our purposes, we'll choose 90% (r = .9) as the threshold.
+
+```{r}
+corr_matrix = cor(train_clean[, -53], use="complete.obs")
+corrplot(corr_matrix, order = "FPC", method = "circle", type = "lower", tl.cex = 0.6, tl.col = rgb(0, 0, 0))
+
+high_corr = findCorrelation(corr_matrix, cutoff = .9)
+```
+
+The correlation matrix shows `r length(findCorrelation(corr_matrix, cutoff = .9))` very highly correlated variables, so let's remove them.
+```{r}
+train_clean = train_clean[, -high_corr]
+quiz_clean = quiz_clean[, -high_corr]
+```
+
+This leaves us with `r dim(train_clean)[2]` variables. For purposes of this report, that's plenty of cleansing and tidying of this data. Now, we need to split the training data into two partitions, one for training the model and one for model validation. We'll use a 75/25 split, respectively.
+
+### Partition training data into training and validation
+```{r}
+train_part = createDataPartition(train_clean$classe, p=0.75, list=FALSE)
+data_train = train_clean[train_part, ]
+data_validate = train_clean[-train_part, ]
+
+# Get a small set of rows to support quickly testing the report.
+# data_train = data_train[sample(nrow(data_train), 1000), ]
+```
+
+## Model Evaluation and Selection
+Now that we have two partitions, let's build the models, then evaluate each, including out-of-sample error. There are many, many options for model-building, but we'll keep things relatively simple and only build a few candidate models.
+
+The main driver of algorithm selection is the number of variables. Basic mulitple regression is often a good place to start, but in this case the number of variables - even after the clean-up we've just done - requires significantly more work, because'd need to evaluate interaction effects among those that remain. That isn't to say that mutliple regression is not appropriate, only that it seems to be more work than it is worth for this analysis. To borrow a phrase, the juice isn't worth the squeeze.
+
+So, let's select a few classification algorithms. With hundreds of options, it's best if we stick to the basics for this exercise. Basic decision tree and random forest are good choices, but it's best to have more than just two. Let's also use the stochsatic gradient boosting and C50 algorithms, both of which are widely understood and accepted.
+
+Besides the algorithms themselves, other considerations include processing time required, the interpretability of results, parameter tuning, among other issues. For this analysis, we need processing time to be in minutes, not hours or more and we need to understand the results so that we can explain and defend them. We'll also skip parameter tuning for this analysis, as it will introduce too many complexities for our purposes.
+
+### Cross-validation
+To validate the models, we'll use repeated k-fold cross-validation, with five folds with two repeats. This seems like the best option, given the nature of the data. Leave-one-out and k-fold both seem a little lightweight since they only take one pass through. Reserve is another option, but again it doesn't seem to offer as much power.
+
+```{r}
+# Define training control, to be used for each model
+ctl = trainControl(method = "repeatedcv", number = 5, repeats = 2)
+
+```
+
+### Decision Tree
+```{r}
+model = rpart(classe ~ ., data = data_train, method="class")
+fancyRpartPlot(model)
+
+predicted = predict(model, newdata = data_validate, type="class")
+conf_matrix_predicted = confusionMatrix(predicted, data_validate$classe)
+
+conf_matrix_dt = as.data.frame(t(conf_matrix_predicted$overall[1]))
+conf_matrix_dt$algorithm = 'Decision Tree'
+
+plot(conf_matrix_predicted$table
+     , col = conf_matrix_predicted$byClass
+     , main = paste("Decision Tree Accuracy ="
+     ,round(conf_matrix_predicted$overall['Accuracy'], 4)))
+```
+
+
+### C50
+```{r}
+model = train(classe ~., data = data_train, method = "C5.0", trControl = ctl)
+
+predicted = predict(model, newdata = data_validate)
+conf_matrix_predicted = confusionMatrix(predicted, data_validate$classe)
+
+conf_matrix_c5 = as.data.frame(t(conf_matrix_predicted$overall[1]))
+conf_matrix_c5$algorithm = 'C50'
+conf_matrix_predicted
+
+```
+
+### Stochastic Gradient Boosting
+
+```{r}
+model = train(classe ~., data = data_train, method = "gbm", trControl = ctl, verbose = FALSE)
+
+predicted = predict(model, newdata = data_validate)
+conf_matrix_predicted = confusionMatrix(predicted, data_validate$classe)
+
+conf_matrix_gbm = as.data.frame(t(conf_matrix_predicted$overall[1]))
+conf_matrix_gbm$algorithm = 'Stochastic Gradient Boosting'
+conf_matrix_predicted
+
+```
+
+### Random Forest
+```{r}
+model = train(classe ~., data = data_train, method = "rf", trControl = ctl)
+
+predicted = predict(model, newdata = data_validate)
+conf_matrix_predicted = confusionMatrix(predicted, data_validate$classe)
+
+conf_matrix_rf = as.data.frame(t(conf_matrix_predicted$overall[1]))
+conf_matrix_rf$algorithm = 'Random Forest'
+conf_matrix_predicted
+ 
+```
+
+## Final Results and Discussion
+```{r}
+conf_matrix_all = rbind(conf_matrix_dt, conf_matrix_c5, conf_matrix_gbm, conf_matrix_rf)
+conf_matrix_all
+```
+
+Let's start the discussion with the basic decision tree. Accuracy is our estimate of out-of-band prediction, and indicates that we only expect to get it right about 73% of the time. That's fairly poor, so we'll drop this from consideration.
+
+The C50 algorithm has been around for a very long time (it was first introduced in the early 1990s) and is well-understood. For this analysis, we stuck with default parameter values, and used the tree-model approach instead of rules. This results in accuracy values consistetly in the high 99% range, regardless of the number of trials, but does beg the question of over-fitting. Still, it does very well.
+
+Stochastic gradient boosting and random forest both produce similarly high levels of accuracy at about 96% and 99%, respectively.
+
+As discussed above, there are many issues to consider when choosing an algorithm. Given that this is part of an academic course, deciding based purely on the accuracy level is probably ok for this exercise. However, with three algorithms producing results so close to 100% - and that's without any parameter tuning - I'd be concerned about over-fitting and/or bias in the experiment. If this were a different scenario, I'd probably suggest more work to ensure we're not over-fitting and a more in-depth study of the data itself for any biases that may affect results.
+
+## Predicting test cases
+```{r}
+predicted_quiz = predict(model, newdata = quiz_clean)
+results = data.frame(problem_id = quiz_clean$problem_id, predicted = predicted_quiz)
+print(results)
+```
